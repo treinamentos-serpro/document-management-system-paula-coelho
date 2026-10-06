@@ -1,27 +1,57 @@
-// Seed do servidor backend do Document Management System.
-//
-// Este arquivo é apenas um ponto de partida mínimo. Ao longo do workshop você
-// vai usar o Agent Mode do GitHub Copilot para construir as camadas:
-//   - routes/       (definição das rotas)
-//   - controllers/  (entrada HTTP e validação)
-//   - services/     (regras de negócio)
-//   - repositories/ (persistência: arquivos locais + metadados em memória)
-//
-// Restrição do projeto: uploads são gravados no filesystem local da aplicação
-// usando multer com diskStorage. Não utilize provedores externos.
-
 const express = require('express');
+const multer = require('multer');
+const path = require('node:path');
+const createDocumentRepository = require('./repositories/documentRepository');
+const createDocumentService = require('./services/documentService');
+const createDocumentController = require('./controllers/documentController');
+const createDocumentRouter = require('./routes/documentRoutes');
 
-const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(express.json());
+function createApp(options = {}) {
+  const storageDir = options.storageDir || process.env.STORAGE_DIR || path.join(__dirname, '../storage');
+  const maxFileSize = Number(options.maxFileSize ?? process.env.MAX_FILE_SIZE ?? 10 * 1024 * 1024);
+  if (!Number.isSafeInteger(maxFileSize) || maxFileSize <= 0) {
+    throw new Error('MAX_FILE_SIZE deve ser um inteiro positivo em bytes.');
+  }
+  const app = express();
+  const repository = createDocumentRepository(storageDir);
+  const service = createDocumentService(repository);
+  const controller = createDocumentController(service);
 
-// Endpoint de verificação de saúde. As demais rotas (/upload, /documents,
-// /documents/:id/download) serão implementadas durante o Passo 2.
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok' });
-});
+  app.use(express.json());
+  app.get('/health', (req, res) => {
+    res.json({ status: 'ok' });
+  });
+  app.use(createDocumentRouter(controller, {
+    prepareStorage: repository.prepareStorage,
+    maxFileSize,
+  }));
+  app.use((error, req, res, next) => {
+    if (res.headersSent) return next(error);
+    let code = error.code;
+    if (error instanceof multer.MulterError) {
+      code = error.code === 'LIMIT_FILE_SIZE' ? 'FILE_TOO_LARGE' : 'INVALID_UPLOAD';
+    }
+    if (error.type === 'entity.parse.failed') code = 'INVALID_UPLOAD';
+    const errors = {
+      FILE_REQUIRED: [400, 'Selecione um arquivo.'],
+      INVALID_UPLOAD: [400, 'Envio de arquivo inválido.'],
+      FILE_TOO_LARGE: [413, 'O arquivo excede o tamanho permitido.'],
+      DOCUMENT_NOT_FOUND: [404, 'Documento não encontrado.'],
+      LIST_ERROR: [500, 'Não foi possível listar os documentos.'],
+      DOWNLOAD_ERROR: [500, 'Não foi possível baixar o documento.'],
+      STORAGE_ERROR: [500, 'Não foi possível armazenar o documento.'],
+    };
+    if (!Object.hasOwn(errors, code)) code = 'STORAGE_ERROR';
+    const [status, message] = errors[code];
+    res.status(status).json({ error: { code, message } });
+  });
+  return app;
+}
+
+const app = createApp();
+app.createApp = createApp;
 
 if (require.main === module) {
   app.listen(PORT, () => {
